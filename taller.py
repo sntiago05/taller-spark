@@ -1,6 +1,9 @@
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, StructField, StructType
+
+
+def vacio(columna):
+    return F.col(columna).isNull() | (F.trim(F.col(columna)) == "")
 
 
 def perfilar(df, nombre, clave):
@@ -10,15 +13,15 @@ def perfilar(df, nombre, clave):
         F.count("*").alias("filas"),
         F.countDistinct(clave).alias("claves_distintas"),
         *[
-            F.count(F.when(F.col(c).isNull() | (F.trim(F.col(c)) == ""), 1)).alias(c)
-            for c in df.columns
+            F.count(F.when(vacio(columna), 1)).alias(columna)
+            for columna in df.columns
         ],
     ).show(vertical=True)
 
 
-def quitar_copias(df, nombre, filas):
+def quitar_copias(df, nombre):
     unicos = df.dropDuplicates().cache()
-    print(f"{nombre}: {filas - unicos.count()} copias exactas retiradas")
+    print(f"{nombre}: {df.count() - unicos.count()} copias exactas retiradas")
     return unicos
 
 
@@ -28,30 +31,23 @@ def clave_repetida(clave):
 
 def separar(df, nombre, motivo, cuarentenas):
     revisado = df.withColumn("motivo", motivo).cache()
-    columnas = [F.col(c) for c in df.columns]
     cuarentenas.append(
-        revisado.where(F.col("motivo").isNotNull()).select(
+        revisado.where("motivo IS NOT NULL").select(
             F.lit(nombre).alias("tabla"),
             "motivo",
-            F.to_json(F.struct(*columnas), {"ignoreNullFields": "false"}).alias("registro"),
+            F.to_json(F.struct(*df.columns), {"ignoreNullFields": "false"}).alias("registro"),
         )
     )
-    return revisado.where(F.col("motivo").isNull()).drop("motivo")
-
-
-def vacio(columna):
-    return F.col(columna).isNull() | (F.trim(F.col(columna)) == "")
+    return revisado.where("motivo IS NULL").drop("motivo")
 
 
 def ejecutar(spark):
+    # Leer y revisar los archivos antes de convertir los tipos.
     def csv(nombre):
-        return spark.read.option("header", True).option("inferSchema", False).csv(
-            f"datos/{nombre}.csv"
-        )
+        return spark.read.csv(f"datos/{nombre}.csv", header=True).cache()
 
     def jsonl(nombre, base):
-        esquema = StructType([StructField(c, StringType()) for c in base.columns])
-        return spark.read.schema(esquema).json(f"datos/incremental/{nombre}.jsonl")
+        return spark.read.schema(base.schema).json(f"datos/incremental/{nombre}.jsonl").cache()
 
     clientes = csv("customers")
     productos = csv("products")
@@ -60,13 +56,6 @@ def ejecutar(spark):
     pedidos_lote = jsonl("orders_incremental", pedidos)
     lineas_lote = jsonl("order_items_incremental", lineas)
     cuarentenas = []
-
-    clientes = clientes.cache()
-    productos = productos.cache()
-    pedidos = pedidos.cache()
-    lineas = lineas.cache()
-    pedidos_lote = pedidos_lote.cache()
-    lineas_lote = lineas_lote.cache()
 
     for df, nombre, clave in [
         (clientes, "clientes", "customer_id"),
@@ -78,12 +67,14 @@ def ejecutar(spark):
     ]:
         perfilar(df, nombre, clave)
 
-    clientes = quitar_copias(clientes, "clientes", clientes.count())
+    # Validar clientes y productos antes de usarlos en los joins.
+    clientes = quitar_copias(clientes, "clientes")
     clientes = clientes.withColumn("alta", F.expr("try_cast(signup_date as date)"))
+    formato_correo = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+    correo_mal_formado = ~vacio("email") & ~F.col("email").rlike(formato_correo)
     clientes.agg(
         F.count(F.when(vacio("email"), 1)).alias("correo_ausente"),
-        F.count(F.when(~vacio("email") & ~F.col("email").rlike(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"), 1))
-        .alias("correo_mal_formado"),
+        F.count(F.when(correo_mal_formado, 1)).alias("correo_mal_formado"),
         F.count(F.when(F.col("alta").isNull(), 1)).alias("fecha_alta_invalida"),
     ).show()
     clientes = separar(
@@ -95,7 +86,7 @@ def ejecutar(spark):
         cuarentenas,
     ).select(F.col("customer_id").alias("cliente_valido"), "country")
 
-    productos = quitar_copias(productos, "productos", productos.count())
+    productos = quitar_copias(productos, "productos")
     productos = productos.withColumn("precio", F.expr("try_cast(unit_price as decimal(14,2))"))
     productos = separar(
         productos,
@@ -107,8 +98,8 @@ def ejecutar(spark):
         cuarentenas,
     ).select(F.col("product_id").alias("producto_valido"), "category", "precio")
 
-    todos_pedidos = pedidos.unionByName(pedidos_lote)
-    pedidos = quitar_copias(todos_pedidos, "pedidos", todos_pedidos.count())
+    # Juntar los dos lotes y quedarse con el pedido más reciente por clave.
+    pedidos = quitar_copias(pedidos.unionByName(pedidos_lote), "pedidos")
     pedidos = pedidos.withColumn("actualizado", F.expr("try_cast(updated_at as timestamp)"))
     pedidos = separar(
         pedidos,
@@ -118,7 +109,7 @@ def ejecutar(spark):
         cuarentenas,
     )
 
-    # Ante fechas iguales, ordenar por los demás campos da un resultado repetible.
+    # row_number numera las versiones desde la más reciente. El resto desempata.
     versiones = Window.partitionBy("order_id").orderBy(
         F.desc("actualizado"), "updated_at", "order_ts", "customer_id", "status", "channel"
     )
@@ -146,8 +137,8 @@ def ejecutar(spark):
         "channel",
     )
 
-    todas_lineas = lineas.unionByName(lineas_lote)
-    lineas = quitar_copias(todas_lineas, "líneas", todas_lineas.count())
+    # Validar las líneas y buscar el pedido y el producto de cada una.
+    lineas = quitar_copias(lineas.unionByName(lineas_lote), "líneas")
     lineas = (
         lineas.withColumn("cantidad", F.expr("try_cast(quantity as int)"))
         .withColumn("descuento", F.expr("try_cast(discount_pct as decimal(5,2))"))
@@ -174,12 +165,13 @@ def ejecutar(spark):
     )
     detalle = detalle.withColumn(
         "importe_neto",
-        (F.col("cantidad") * F.col("precio") * (1 - F.col("descuento"))).cast("decimal(28,4)"),
+        F.expr("cast(cantidad * precio * (1 - descuento) as decimal(28,4))"),
     ).cache()
     resumen = detalle.groupBy("mes", "country", "channel", "category").agg(
         F.sum("importe_neto").alias("ventas_netas")
     ).cache()
 
+    # Comprobar las claves y los totales antes de guardar.
     control = detalle.agg(
         F.count("*").alias("filas"),
         F.countDistinct("line_id").alias("lineas_distintas"),
