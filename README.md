@@ -43,8 +43,12 @@ Parto de las líneas. Con una sola fila válida por pedido, cliente y producto, 
 | Grupos en el Parquet mensual | 208 |
 | Registros en el Parquet de cuarentena | 845 |
 
+Las 40.226 líneas de entrada se reparten en 39.386 válidas y 840 en cuarentena. Los otros cinco registros de la cuarentena corresponden a tres pedidos y dos productos.
+
 ## Incremental
 
 Combino el histórico y el lote, retiro las copias exactas y elijo el mayor `updated_at` por `order_id`. Si hay un empate de fecha, ordeno por los demás campos para resolverlo de forma repetible. O00005 conserva la versión con `updated_at` de `2026-03-05T12:00:00Z`. El mes sigue saliendo de `order_ts`.
 
 El lote trae 100 pedidos nuevos, una versión tardía de un pedido existente y 200 líneas nuevas. Deduplico las líneas por sus copias exactas y verifico que `line_id` sea único en el detalle válido. Cada ejecución reconstruye y sobrescribe los Parquet, de modo que repetir el mismo lote conserva el mismo contenido.
+
+Al duplicar ambos JSONL en una copia del proyecto, el conteo siguió en 20.100 pedidos únicos antes de validar referencias. Los dos Parquet coincidieron fila por fila con la ejecución de un solo lote.
