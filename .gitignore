@@ -1,0 +1,4 @@
+.git-local/
+.venv/
+__pycache__/
+output/
