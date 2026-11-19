@@ -28,7 +28,7 @@ Clientes y productos se identifican por `customer_id` y `product_id`. Cada pedid
 | Correo mal formado en C0007 y correo ausente en C0013 | Reporto ambos y conservo los clientes porque su país se puede usar para agrupar. |
 | Cliente inexistente en O00007, cliente ausente en O00011 y fecha imposible en O00025 | Envío a cuarentena los pedidos y las líneas que dependen de ellos. |
 | L0000003 referencia un pedido inexistente y L0000004, un producto inexistente | Envío las líneas a cuarentena porque falta una referencia necesaria. |
-| L0000001 y L0000002 tienen cantidad no positiva, L0000005 tiene descuento 1.2, P088 tiene precio negativo y P089 no tiene precio | Exijo cantidades enteras positivas, descuentos entre 0 y 1 y precios positivos. Envío a cuarentena los registros inválidos y las líneas que requieren un producto descartado. |
+| L0000001 y L0000002 tienen cantidad no positiva, L0000005 tiene descuento 1.2, P088 tiene precio negativo y P089 no tiene precio | Exijo cantidades enteras positivas, descuentos entre 0 y 1 antes de redondear, y precios positivos. Envío a cuarentena los registros inválidos y las líneas que requieren un producto descartado. |
 
 La cuarentena guarda cada registro excluido con el primer motivo aplicable. Incluyo todos los estados del pedido y los productos inactivos con precio válido porque la consigna no pide filtrar por estado ni por vigencia.
 
@@ -38,7 +38,7 @@ Parto de las líneas. Con una sola fila válida por pedido, cliente y producto, 
 
 | Control | Resultado con los datos incluidos |
 | --- | ---: |
-| Filas válidas del detalle y claves `line_id` distintas | 39.386 en ambos conteos |
+| Filas válidas, claves `line_id` distintas e importes calculados | 39.386 en los tres conteos |
 | Suma del detalle y suma del resumen | 95703917.8750 en ambas |
 | Grupos en el Parquet mensual | 208 |
 | Registros en el Parquet de cuarentena | 845 |

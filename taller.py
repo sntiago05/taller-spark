@@ -41,8 +41,7 @@ def separar(df, nombre, motivo, cuarentenas):
     return revisado.where("motivo IS NULL").drop("motivo")
 
 
-def ejecutar(spark):
-    # Leer y revisar los archivos antes de convertir los tipos.
+def leer_y_perfilar(spark):
     def csv(nombre):
         return spark.read.csv(f"datos/{nombre}.csv", header=True).cache()
 
@@ -55,8 +54,6 @@ def ejecutar(spark):
     lineas = csv("order_items")
     pedidos_lote = jsonl("orders_incremental", pedidos)
     lineas_lote = jsonl("order_items_incremental", lineas)
-    cuarentenas = []
-
     for df, nombre, clave in [
         (clientes, "clientes", "customer_id"),
         (productos, "productos", "product_id"),
@@ -67,7 +64,10 @@ def ejecutar(spark):
     ]:
         perfilar(df, nombre, clave)
 
-    # Validar clientes y productos antes de usarlos en los joins.
+    return clientes, productos, pedidos.unionByName(pedidos_lote), lineas.unionByName(lineas_lote)
+
+
+def limpiar_clientes(clientes, cuarentenas):
     clientes = quitar_copias(clientes, "clientes")
     clientes = clientes.withColumn("alta", F.expr("try_cast(signup_date as date)"))
     formato_correo = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
@@ -77,7 +77,7 @@ def ejecutar(spark):
         F.count(F.when(correo_mal_formado, 1)).alias("correo_mal_formado"),
         F.count(F.when(F.col("alta").isNull(), 1)).alias("fecha_alta_invalida"),
     ).show()
-    clientes = separar(
+    return separar(
         clientes,
         "clientes",
         F.when(vacio("customer_id"), "cliente sin clave")
@@ -86,9 +86,11 @@ def ejecutar(spark):
         cuarentenas,
     ).select(F.col("customer_id").alias("cliente_valido"), "country")
 
+
+def limpiar_productos(productos, cuarentenas):
     productos = quitar_copias(productos, "productos")
     productos = productos.withColumn("precio", F.expr("try_cast(unit_price as decimal(14,2))"))
-    productos = separar(
+    return separar(
         productos,
         "productos",
         F.when(vacio("product_id"), "producto sin clave")
@@ -98,8 +100,9 @@ def ejecutar(spark):
         cuarentenas,
     ).select(F.col("product_id").alias("producto_valido"), "category", "precio")
 
-    # Juntar los dos lotes y quedarse con el pedido más reciente por clave.
-    pedidos = quitar_copias(pedidos.unionByName(pedidos_lote), "pedidos")
+
+def elegir_pedidos_recientes(pedidos, cuarentenas):
+    pedidos = quitar_copias(pedidos, "pedidos")
     pedidos = pedidos.withColumn("actualizado", F.expr("try_cast(updated_at as timestamp)"))
     pedidos = separar(
         pedidos,
@@ -117,12 +120,17 @@ def ejecutar(spark):
     print(f"Versiones anteriores de pedidos: {ordenados.where('version > 1').count()}")
     pedidos = ordenados.where("version = 1").drop("version")
     print(f"Pedidos únicos antes de validar los datos de la versión vigente: {pedidos.count()}")
+    return pedidos
+
+
+def limpiar_pedidos(pedidos, clientes, cuarentenas):
+    pedidos = elegir_pedidos_recientes(pedidos, cuarentenas)
     print(f"Estados deliverd corregidos: {pedidos.where(F.col('status') == 'deliverd').count()}")
     pedidos = pedidos.withColumn(
         "status", F.when(F.col("status") == "deliverd", "delivered").otherwise(F.col("status"))
     ).withColumn("fecha_pedido", F.expr("try_cast(order_ts as timestamp)"))
     pedidos = pedidos.join(clientes, pedidos.customer_id == clientes.cliente_valido, "left")
-    pedidos = separar(
+    return separar(
         pedidos,
         "pedidos",
         F.when(vacio("customer_id"), "pedido sin cliente")
@@ -137,21 +145,28 @@ def ejecutar(spark):
         "channel",
     )
 
-    # Validar las líneas y buscar el pedido y el producto de cada una.
-    lineas = quitar_copias(lineas.unionByName(lineas_lote), "líneas")
+
+def limpiar_lineas(lineas, cuarentenas):
+    lineas = quitar_copias(lineas, "líneas")
     lineas = (
         lineas.withColumn("cantidad", F.expr("try_cast(quantity as int)"))
         .withColumn("descuento", F.expr("try_cast(discount_pct as decimal(5,2))"))
     )
-    lineas = separar(
+    # Comprobar el rango antes de redondear el descuento para el cálculo.
+    descuento_original = F.expr("try_cast(discount_pct as decimal(38,30))")
+    descuento_invalido = descuento_original.isNull() | ~descuento_original.between(0, 1)
+    return separar(
         lineas,
         "líneas",
         F.when(vacio("line_id"), "línea sin clave")
         .when(clave_repetida("line_id"), "clave de línea en conflicto")
         .when(F.col("cantidad").isNull() | (F.col("cantidad") <= 0), "cantidad inválida")
-        .when(F.col("descuento").isNull() | ~F.col("descuento").between(0, 1), "descuento inválido"),
+        .when(descuento_invalido, "descuento inválido"),
         cuarentenas,
     )
+
+
+def calcular_detalle(lineas, pedidos, productos, cuarentenas):
     con_pedido = lineas.join(pedidos, lineas.order_id == pedidos.pedido_valido, "left")
     con_producto = con_pedido.join(
         productos, con_pedido.product_id == productos.producto_valido, "left"
@@ -163,18 +178,17 @@ def ejecutar(spark):
         .when(F.col("producto_valido").isNull(), "producto sin referencia válida"),
         cuarentenas,
     )
-    detalle = detalle.withColumn(
+    return detalle.withColumn(
         "importe_neto",
         F.expr("cast(cantidad * precio * (1 - descuento) as decimal(28,4))"),
-    ).cache()
-    resumen = detalle.groupBy("mes", "country", "channel", "category").agg(
-        F.sum("importe_neto").alias("ventas_netas")
-    ).cache()
+    )
 
-    # Comprobar las claves y los totales antes de guardar.
+
+def validar_totales(detalle, resumen):
     control = detalle.agg(
         F.count("*").alias("filas"),
         F.countDistinct("line_id").alias("lineas_distintas"),
+        F.count("importe_neto").alias("importes_calculados"),
         F.sum("importe_neto").alias("total"),
     ).first()
     total_resumen = resumen.agg(F.sum("ventas_netas")).first()[0]
@@ -182,9 +196,13 @@ def ejecutar(spark):
     print(f"QA 2 - Total detalle: {control.total}, total resumen: {total_resumen}")
     if control.filas == 0 or control.filas != control.lineas_distintas:
         raise ValueError("El detalle está vacío o tiene líneas repetidas.")
+    if control.filas != control.importes_calculados:
+        raise ValueError("Hay líneas válidas sin importe neto.")
     if control.total is None or control.total != total_resumen:
         raise ValueError("El detalle y el resumen no reconcilian.")
 
+
+def guardar_resultados(resumen, cuarentenas):
     cuarentena = cuarentenas[0]
     for registros in cuarentenas[1:]:
         cuarentena = cuarentena.unionByName(registros)
@@ -193,6 +211,21 @@ def ejecutar(spark):
     resumen.orderBy("mes", "country", "channel", "category").show()
     resumen.coalesce(1).write.mode("overwrite").parquet("output/ventas_mensuales")
     cuarentena.coalesce(1).write.mode("overwrite").parquet("output/cuarentena")
+
+
+def ejecutar(spark):
+    clientes, productos, pedidos, lineas = leer_y_perfilar(spark)
+    cuarentenas = []
+    clientes = limpiar_clientes(clientes, cuarentenas)
+    productos = limpiar_productos(productos, cuarentenas)
+    pedidos = limpiar_pedidos(pedidos, clientes, cuarentenas)
+    lineas = limpiar_lineas(lineas, cuarentenas)
+    detalle = calcular_detalle(lineas, pedidos, productos, cuarentenas).cache()
+    resumen = detalle.groupBy("mes", "country", "channel", "category").agg(
+        F.sum("importe_neto").alias("ventas_netas")
+    ).cache()
+    validar_totales(detalle, resumen)
+    guardar_resultados(resumen, cuarentenas)
 
 
 if __name__ == "__main__":
