@@ -199,8 +199,8 @@ def ejecutar(spark):
     cuarentena = cuarentena.cache()
     cuarentena.groupBy("tabla", "motivo").count().orderBy("tabla", "motivo").show(truncate=False)
     resumen.orderBy("mes", "country", "channel", "category").show()
-    resumen.write.mode("overwrite").parquet("output/ventas_mensuales")
-    cuarentena.write.mode("overwrite").parquet("output/cuarentena")
+    resumen.coalesce(1).write.mode("overwrite").parquet("output/ventas_mensuales")
+    cuarentena.coalesce(1).write.mode("overwrite").parquet("output/cuarentena")
 
 
 if __name__ == "__main__":
